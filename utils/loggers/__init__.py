@@ -15,14 +15,20 @@ from utils.loggers.wandb.wandb_utils import WandbLogger
 from utils.plots import plot_images, plot_results
 from utils.torch_utils import de_parallel
 
-LOGGERS = ('csv', 'tb', 'wandb')  # text-file, TensorBoard, Weights & Biases
-RANK = int(os.getenv('RANK', -1))
+import pandas as pd
+from PIL import Image
+
+LOGGERS = ("csv", "tb", "wandb", "clearml")  # text-file, TensorBoard, Weights & Biases
+RANK = int(os.getenv("RANK", -1))
 
 try:
     import wandb
 
-    assert hasattr(wandb, '__version__')  # verify package import not local dir
-    if pkg.parse_version(wandb.__version__) >= pkg.parse_version('0.12.2') and RANK in {0, -1}:
+    assert hasattr(wandb, "__version__")  # verify package import not local dir
+    if pkg.parse_version(wandb.__version__) >= pkg.parse_version("1.4.1") and RANK in {
+        0,
+        -1,
+    }:
         try:
             wandb_login_success = wandb.login(timeout=30)
         except wandb.errors.UsageError:  # known non-TTY terminal issue
@@ -32,10 +38,59 @@ try:
 except (ImportError, AssertionError):
     wandb = None
 
+# TODO: finish this portion
+try:
+    import clearml
+    from clearml import Task, Logger
 
-class Loggers():
+    clearml_login_success = False
+
+    assert hasattr(clearml, "__version__")  # verify package import not local dir
+    clearml_task = None
+
+    if pkg.parse_version(clearml.__version__) >= pkg.parse_version(
+        "0.12.2"
+    ) and RANK in {
+        0,
+        -1,
+    }:
+        print(f"Clearml Loaded")
+        # TODO: make this configurable at top level, currently using defaults
+        # TODO: add output_uri="s3://"
+        try:
+            clearml_task = Task.init(
+                project_name="Yolov5",
+                task_name="yolov5s-training",
+                auto_connect_frameworks={"pytorch": True},
+                # below can be set to push to S3 instead of ClearML
+                output_uri=True,
+            )
+            clearml_login_success = True
+
+            print(f"Clearml task initialized: {clearml_task.id}")
+            # TODO: exit this if clearml could not be initialized
+
+        except Exception as ex:  # TODO: make exception specific
+            clearml_login_success = False
+            raise Exception(f"Could not initialize ClearML task properly: {ex}")
+        if not clearml_login_success:
+            clearml = None
+
+except (ImportError, AssertionError):
+    clearml = None
+
+
+class Loggers:
     # YOLOv5 Loggers class
-    def __init__(self, save_dir=None, weights=None, opt=None, hyp=None, logger=None, include=LOGGERS):
+    def __init__(
+        self,
+        save_dir=None,
+        weights=None,
+        opt=None,
+        hyp=None,
+        logger=None,
+        include=LOGGERS,
+    ):
         self.save_dir = save_dir
         self.weights = weights
         self.opt = opt
@@ -43,75 +98,122 @@ class Loggers():
         self.logger = logger  # for printing results to console
         self.include = include
         self.keys = [
-            'train/box_loss',
-            'train/obj_loss',
-            'train/cls_loss',  # train loss
-            'metrics/precision',
-            'metrics/recall',
-            'metrics/mAP_0.5',
-            'metrics/mAP_0.5:0.95',  # metrics
-            'val/box_loss',
-            'val/obj_loss',
-            'val/cls_loss',  # val loss
-            'x/lr0',
-            'x/lr1',
-            'x/lr2']  # params
-        self.best_keys = ['best/epoch', 'best/precision', 'best/recall', 'best/mAP_0.5', 'best/mAP_0.5:0.95']
+            "train/box_loss",
+            "train/obj_loss",
+            "train/cls_loss",  # train loss
+            "metrics/precision",
+            "metrics/recall",
+            "metrics/mAP_0.5",
+            "metrics/mAP_0.5:0.95",  # metrics
+            "val/box_loss",
+            "val/obj_loss",
+            "val/cls_loss",  # val loss
+            "x/lr0",
+            "x/lr1",
+            "x/lr2",
+        ]  # params
+        self.best_keys = [
+            "best/epoch",
+            "best/precision",
+            "best/recall",
+            "best/mAP_0.5",
+            "best/mAP_0.5:0.95",
+        ]
         for k in LOGGERS:
             setattr(self, k, None)  # init empty logger dictionary
         self.csv = True  # always log to csv
 
         # Message
         if not wandb:
-            prefix = colorstr('Weights & Biases: ')
+            prefix = colorstr("Weights & Biases: ")
             s = f"{prefix}run 'pip install wandb' to automatically track and visualize YOLOv5 🚀 runs (RECOMMENDED)"
             self.logger.info(emojis(s))
 
         # TensorBoard
         s = self.save_dir
-        if 'tb' in self.include and not self.opt.evolve:
-            prefix = colorstr('TensorBoard: ')
-            self.logger.info(f"{prefix}Start with 'tensorboard --logdir {s.parent}', view at http://localhost:6006/")
+        if "tb" in self.include and not self.opt.evolve:
+            prefix = colorstr("TensorBoard: ")
+            self.logger.info(
+                f"{prefix}Start with 'tensorboard --logdir {s.parent}', view at http://localhost:6006/"
+            )
             self.tb = SummaryWriter(str(s))
 
         # W&B
-        if wandb and 'wandb' in self.include:
-            wandb_artifact_resume = isinstance(self.opt.resume, str) and self.opt.resume.startswith('wandb-artifact://')
-            run_id = torch.load(self.weights).get('wandb_id') if self.opt.resume and not wandb_artifact_resume else None
+        if wandb and "wandb" in self.include:
+            wandb_artifact_resume = isinstance(
+                self.opt.resume, str
+            ) and self.opt.resume.startswith("wandb-artifact://")
+            run_id = (
+                torch.load(self.weights).get("wandb_id")
+                if self.opt.resume and not wandb_artifact_resume
+                else None
+            )
             self.opt.hyp = self.hyp  # add hyperparameters
             self.wandb = WandbLogger(self.opt, run_id)
             # temp warn. because nested artifacts not supported after 0.12.10
-            if pkg.parse_version(wandb.__version__) >= pkg.parse_version('0.12.11'):
+            if pkg.parse_version(wandb.__version__) >= pkg.parse_version("0.12.11"):
                 self.logger.warning(
                     "YOLOv5 temporarily requires wandb version 0.12.10 or below. Some features may not work as expected."
                 )
         else:
             self.wandb = None
 
+        if clearml and "clearml" in self.include:
+
+            self.clearml = clearml_task
+            self.clearml_task_id = self.clearml.task_id
+            print(f"Clearml Task ID: {self.clearml_task_id}")
+
+        else:
+            self.clearml = None
+
     def on_train_start(self):
         # Callback runs on train start
-        pass
+        print(f"Training started")
+
+        # TODO: get clearml task by ID
+        clearml_task = Task.get_task(task_id=self.clearml_task_id)
+        clearml_logger = clearml_task.get_logger()
+
+        print(f"Training start callback complete")
 
     def on_pretrain_routine_end(self):
         # Callback runs on pre-train routine end
-        paths = self.save_dir.glob('*labels*.jpg')  # training labels
+        paths = self.save_dir.glob("*labels*.jpg")  # training labels
         if self.wandb:
-            self.wandb.log({"Labels": [wandb.Image(str(x), caption=x.name) for x in paths]})
+            self.wandb.log(
+                {"Labels": [wandb.Image(str(x), caption=x.name) for x in paths]}
+            )
 
     def on_train_batch_end(self, ni, model, imgs, targets, paths, plots):
         # Callback runs on train batch end
         if plots:
             if ni == 0:
-                if not self.opt.sync_bn:  # --sync known issue https://github.com/ultralytics/yolov5/issues/3754
+                if (
+                    not self.opt.sync_bn
+                ):  # --sync known issue https://github.com/ultralytics/yolov5/issues/3754
                     with warnings.catch_warnings():
-                        warnings.simplefilter('ignore')  # suppress jit trace warning
-                        self.tb.add_graph(torch.jit.trace(de_parallel(model), imgs[0:1], strict=False), [])
+                        warnings.simplefilter("ignore")  # suppress jit trace warning
+                        self.tb.add_graph(
+                            torch.jit.trace(
+                                de_parallel(model), imgs[0:1], strict=False
+                            ),
+                            [],
+                        )
             if ni < 3:
-                f = self.save_dir / f'train_batch{ni}.jpg'  # filename
+                f = self.save_dir / f"train_batch{ni}.jpg"  # filename
                 plot_images(imgs, targets, paths, f)
             if self.wandb and ni == 10:
-                files = sorted(self.save_dir.glob('train*.jpg'))
-                self.wandb.log({'Mosaics': [wandb.Image(str(f), caption=f.name) for f in files if f.exists()]})
+                files = sorted(self.save_dir.glob("train*.jpg"))
+                self.wandb.log(
+                    {
+                        "Mosaics": [
+                            wandb.Image(str(f), caption=f.name)
+                            for f in files
+                            if f.exists()
+                        ]
+                    }
+                )
 
     def on_train_epoch_end(self, epoch):
         # Callback runs on train epoch end
@@ -126,18 +228,25 @@ class Loggers():
     def on_val_end(self):
         # Callback runs on val end
         if self.wandb:
-            files = sorted(self.save_dir.glob('val*.jpg'))
-            self.wandb.log({"Validation": [wandb.Image(str(f), caption=f.name) for f in files]})
+            files = sorted(self.save_dir.glob("val*.jpg"))
+            self.wandb.log(
+                {"Validation": [wandb.Image(str(f), caption=f.name) for f in files]}
+            )
 
     def on_fit_epoch_end(self, vals, epoch, best_fitness, fi):
         # Callback runs at the end of each fit (train+val) epoch
+
         x = dict(zip(self.keys, vals))
         if self.csv:
-            file = self.save_dir / 'results.csv'
+            file = self.save_dir / "results.csv"
             n = len(x) + 1  # number of cols
-            s = '' if file.exists() else (('%20s,' * n % tuple(['epoch'] + self.keys)).rstrip(',') + '\n')  # add header
-            with open(file, 'a') as f:
-                f.write(s + ('%20.5g,' * n % tuple([epoch] + vals)).rstrip(',') + '\n')
+            s = (
+                ""
+                if file.exists()
+                else (("%20s," * n % tuple(["epoch"] + self.keys)).rstrip(",") + "\n")
+            )  # add header
+            with open(file, "a") as f:
+                f.write(s + ("%20.5g," * n % tuple([epoch] + vals)).rstrip(",") + "\n")
 
         if self.tb:
             for k, v in x.items():
@@ -147,38 +256,87 @@ class Loggers():
             if best_fitness == fi:
                 best_results = [epoch] + vals[3:7]
                 for i, name in enumerate(self.best_keys):
-                    self.wandb.wandb_run.summary[name] = best_results[i]  # log best results in the summary
+                    self.wandb.wandb_run.summary[name] = best_results[
+                        i
+                    ]  # log best results in the summary
             self.wandb.log(x)
             self.wandb.end_epoch(best_result=best_fitness == fi)
+
+        # TODO: complete implementation
+        if self.clearml:
+            print(f"Attempting clearml logger for epoch: {epoch}")
+            print(f"Clearml Task ID: {self.clearml_task_id}")
+            clearml_task = Task.get_task(task_id=self.clearml_task_id)
+            clearml_logger = clearml_task.get_logger()
+
+            # for k, v in x.items():
+            #    self.tb.add_scalar(k, v, epoch)
+            #    logger.report_scalar(k, k, iteration=epoch, value=v)
+            for k, v in x.items():
+                # print(f"{k}:{v}:{epoch}")
+                clearml_logger.report_scalar(k, "Series A", iteration=epoch, value=v)
+
+            # for i, name in enumerate(self.best_keys):
+            #    logger.report_scalar(name, "Series A", iteration=epoch, value=i)
 
     def on_model_save(self, last, epoch, final_epoch, best_fitness, fi):
         # Callback runs on model save event
         if self.wandb:
-            if ((epoch + 1) % self.opt.save_period == 0 and not final_epoch) and self.opt.save_period != -1:
-                self.wandb.log_model(last.parent, self.opt, epoch, fi, best_model=best_fitness == fi)
+            if (
+                (epoch + 1) % self.opt.save_period == 0 and not final_epoch
+            ) and self.opt.save_period != -1:
+                self.wandb.log_model(
+                    last.parent, self.opt, epoch, fi, best_model=best_fitness == fi
+                )
 
     def on_train_end(self, last, best, plots, epoch, results):
         # Callback runs on training end
         if plots:
-            plot_results(file=self.save_dir / 'results.csv')  # save results.png
-        files = ['results.png', 'confusion_matrix.png', *(f'{x}_curve.png' for x in ('F1', 'PR', 'P', 'R'))]
-        files = [(self.save_dir / f) for f in files if (self.save_dir / f).exists()]  # filter
+            plot_results(file=self.save_dir / "results.csv")  # save results.png
+        files = [
+            "results.png",
+            "confusion_matrix.png",
+            *(f"{x}_curve.png" for x in ("F1", "PR", "P", "R")),
+        ]
+        files = [
+            (self.save_dir / f) for f in files if (self.save_dir / f).exists()
+        ]  # filter
         self.logger.info(f"Results saved to {colorstr('bold', self.save_dir)}")
 
         if self.tb:
             for f in files:
-                self.tb.add_image(f.stem, cv2.imread(str(f))[..., ::-1], epoch, dataformats='HWC')
+                self.tb.add_image(
+                    f.stem, cv2.imread(str(f))[..., ::-1], epoch, dataformats="HWC"
+                )
 
         if self.wandb:
             self.wandb.log(dict(zip(self.keys[3:10], results)))
-            self.wandb.log({"Results": [wandb.Image(str(f), caption=f.name) for f in files]})
+            self.wandb.log(
+                {"Results": [wandb.Image(str(f), caption=f.name) for f in files]}
+            )
             # Calling wandb.log. TODO: Refactor this into WandbLogger.log_model
             if not self.opt.evolve:
-                wandb.log_artifact(str(best if best.exists() else last),
-                                   type='model',
-                                   name=f'run_{self.wandb.wandb_run.id}_model',
-                                   aliases=['latest', 'best', 'stripped'])
+                wandb.log_artifact(
+                    str(best if best.exists() else last),
+                    type="model",
+                    name=f"run_{self.wandb.wandb_run.id}_model",
+                    aliases=["latest", "best", "stripped"],
+                )
             self.wandb.finish_run()
+
+        # TODO: complete this
+        if self.clearml:
+
+            clearml_task = Task.get_task(task_id=self.clearml_task_id)
+
+            for f in files:
+                im = Image.open(os.path.join(str(f)))
+                clearml_task.upload_artifact(os.path.basename(f), im)
+
+            print(f"Attempting to close ClearML run")
+            clearml_task.flush(wait_for_uploads=False)
+            # TODO: validate if this is correct, it does allow for completion though. Used to hang.
+            clearml_task.completed(ignore_errors=True)
 
     def on_params_update(self, params):
         # Update hyperparams or configs of the experiment
